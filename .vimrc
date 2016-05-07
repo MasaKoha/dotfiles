@@ -52,7 +52,7 @@ augroup PluginInstall
 augroup END
 
 " 各プラグインをインストールするディレクトリ
-let s:plugin_dir = expand('~/.vim/bundle/')
+let s:plugin_dir = expand('~/.vim/dein/')
 " dein.vimをインストールするディレクトリをランタイムパスへ追加
 let s:dein_dir = s:plugin_dir . 'repos/github.com/Shougo/dein.vim'
 execute 'set runtimepath+=' . s:dein_dir
