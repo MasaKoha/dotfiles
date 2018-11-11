@@ -2,7 +2,7 @@ set number  " 行番号の表示
 set showcmd  "入力中のコマンドを表示
 set showmatch " 対応する括弧を強調表示
 set ruler
-
+set nocompatible
 " vimでファイルを開くときのファイル名保管
 set nowildmenu
 set wildmode=longest,list,full
@@ -41,95 +41,4 @@ au BufWinEnter * let w:m3 = matchadd("ZenkakuSpace", '　')
 au WinEnter * let w:m3 = matchadd("ZenkakuSpace", '　')
 
 imap <c-[> <esc>
-
-set nocompatible
-
-" Vim起動完了時にインストール
-" http://yuheikagaya.hatenablog.jp/entry/2016/03/20/171907 から引用
-augroup PluginInstall
-  autocmd!
-  autocmd VimEnter * if dein#check_install() | call dein#install() | endif
-augroup END
-
-" 各プラグインをインストールするディレクトリ
-let s:plugin_dir = expand('~/.vim/dein/')
-" dein.vimをインストールするディレクトリをランタイムパスへ追加
-let s:dein_dir = s:plugin_dir . 'repos/github.com/Shougo/dein.vim'
-execute 'set runtimepath+=' . s:dein_dir
-
-" dein.vimがまだ入ってなければ 最初に`git clone`
-if !isdirectory(s:dein_dir)
-  call mkdir(s:dein_dir, 'p')
-  silent execute printf('!git clone %s %s', 'https://github.com/Shougo/dein.vim', s:dein_dir)
-endif
-
-if dein#load_state(s:plugin_dir)
-  call dein#begin(s:plugin_dir)
-
-  " ここからインストールするプラグインを書いていく
-  call dein#add('Shougo/dein.vim')
-  call dein#add('Shougo/neocomplete.vim')
-  call dein#add('fatih/vim-go')
-
-  " インストール後ビルドする場合
-  " call dein#add('Shougo/vimproc.vim', {
-  "       \ 'build': {
-  "       \     'mac': 'make -f make_mac.mak',
-  "       \     'linux': 'make',
-  "       \     'unix': 'gmake',
-  "       \    },
-  "       \ })
-
-  " 条件によって使ったり使わなかったり制御する場合
-  " call dein#add('Shougo/neocomplete.vim', {
-  "       \ 'if' : has('lua')
-  "       \ })
-
-  " " 依存関係がある場合
-  " call dein#add('Shougo/unite.vim')
-  " call dein#add('ujihisa/unite-colorscheme', {'depends' : 'Shougo/unite.vim'})
-
-  " " 手動でcall dein#source('プラグイン名')して使い始める場合
-  " call dein#add('Shougo/vimfiler', {'lazy' : 1})
-
-  " " 指定のファイルタイプ使う場合
-  " call dein#add('tpope/vim-rails', {'on_ft' : 'ruby'})
-
-  " " dein.vimで管理して更新だけするリポジトリ（NeoBundleFetchとおなじ）
-  " call dein#add('jszakmeister/markdown2ctags', {'rtp': ''})
-
-  " " サブディレクトリを指定してdein#add()する場合
-  " " frozenオプションは自動で更新しない
-  " " 自分で開発するプラグインの管理に便利
-  " call dein#local('~/src/github.com/violetyk',
-  "       \ {
-  "       \   'frozen' : 1,
-  "       \   'depends' : [
-  "       \     'kana/vim-gf-user',
-  "       \     'Shougo/neosnippet.vim',
-  "       \     'vim-jp/vital.vim'
-  "       \   ]
-  "       \ },
-  "       \ [
-  "       \   '*.vim',
-  "       \   'neosnippet-*',
-  "       \   'neocomplete-*',
-  "       \   'scratch-utility'
-  "       \ ])
-  call dein#end()
-  call dein#save_state()
-endif
-filetype plugin indent on
-"" 引用ここまで
-
-let g:go_highlight_functions = 1
-let g:go_highlight_methods = 1
-let g:go_highlight_structs = 1
-let g:go_highlight_interfaces = 1
-let g:go_highlight_operators = 1
-let g:go_highlight_build_constraints = 1
-let g:go_fmt_command = "goimports"
-
-
-
 syntax on
