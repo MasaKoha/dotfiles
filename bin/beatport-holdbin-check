@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""
+Beatport Hold Bin duplicate checker.
+
+Chrome で Beatport にログイン済みの状態で実行する。
+Chrome > 表示 > デベロッパー > Apple Events からの JavaScript を許可 が有効であること。
+
+Usage:
+    beatport-holdbin-check [--json]
+"""
+
+import subprocess
+import json
+import sys
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from collections import defaultdict
+
+API_BASE = "https://api.beatport.com/v4"
+
+
+# ---------------------------------------------------------------------------
+# Chrome / Auth
+# ---------------------------------------------------------------------------
+
+def get_token():
+    """Chrome の Beatport セッションからアクセストークンを取得する。
+    任意のウィンドウ・タブから beatport.com を探し、セッション API を叩く。
+    """
+    script = '''
+tell application "Google Chrome"
+    repeat with w in windows
+        repeat with t in tabs of w
+            if URL of t contains "beatport.com" then
+                tell t
+                    return execute javascript "
+                        (function() {
+                            try {
+                                var x = new XMLHttpRequest();
+                                x.open('GET', '/api/auth/session', false);
+                                x.send();
+                                var s = JSON.parse(x.responseText);
+                                if (s && s.token && s.token.accessToken) return s.token.accessToken;
+                                return 'ERR:NOT_LOGGED_IN';
+                            } catch(e) { return 'ERR:' + e.message; }
+                        })()
+                    "
+                end tell
+            end if
+        end repeat
+    end repeat
+    return "ERR:NO_TAB"
+end tell
+'''
+    proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if proc.returncode != 0:
+        err = proc.stderr.strip()
+        if "JavaScript" in err:
+            die("Chrome > 表示 > デベロッパー > Apple Events からの JavaScript を許可 を有効にしてください")
+        die(f"Chrome との通信に失敗: {err}")
+
+    token = proc.stdout.strip()
+    if token.startswith("ERR:"):
+        code = token[4:]
+        if code == "NO_TAB":
+            die("Chrome に beatport.com のタブが見つかりません")
+        elif code == "NOT_LOGGED_IN":
+            die("Beatport にログインしていません")
+        else:
+            die(f"トークン取得エラー: {code}")
+    return token
+
+
+# ---------------------------------------------------------------------------
+# Beatport API
+# ---------------------------------------------------------------------------
+
+def api_get(path, token):
+    req = Request(f"{API_BASE}{path}", headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except HTTPError as e:
+        die(f"API エラー {e.code}: {path}")
+    except URLError as e:
+        die(f"接続エラー: {e.reason}")
+
+
+def find_holdbin_cart_id(token):
+    """Hold Bin のカート ID を返す。"""
+    data = api_get("/my/carts/", token)
+    carts = data if isinstance(data, list) else data.get("results", [data])
+
+    # Why: Beatport API はカート名 "hold-bin" で Hold Bin を識別する
+    for cart in carts:
+        if isinstance(cart, dict) and cart.get("name") == "hold-bin":
+            return cart["id"]
+
+    # Why: fallback — name フィールドがない場合、items 数が多い方を Hold Bin と判定
+    best_id = None
+    best_count = -1
+    for cart in carts:
+        cid = cart if isinstance(cart, int) else cart.get("id")
+        if cid is None:
+            continue
+        try:
+            t = api_get(f"/my/carts/{cid}/items/tracks/?per_page=1", token)
+            r = api_get(f"/my/carts/{cid}/items/releases/?per_page=1", token)
+            total = t.get("count", 0) + r.get("count", 0)
+            if total > best_count:
+                best_count = total
+                best_id = cid
+        except SystemExit:
+            continue
+
+    if best_id is None:
+        die("Hold Bin が見つからないか空です")
+    return best_id
+
+
+def fetch_holdbin_items(cart_id, token):
+    """Hold Bin の個別トラックとリリース一覧を返す。"""
+    tracks_data = api_get(f"/my/carts/{cart_id}/items/tracks/?page=1&per_page=500", token)
+    releases_data = api_get(f"/my/carts/{cart_id}/items/releases/?page=1&per_page=500", token)
+
+    individual_tracks = []
+    for item in tracks_data.get("results", []):
+        t = item.get("item", item)
+        individual_tracks.append({
+            "id": t["id"],
+            "name": t["name"],
+            "mix": t.get("mix_name", "Original Mix"),
+            "artists": ", ".join(a["name"] for a in t.get("artists", [])),
+        })
+
+    releases = []
+    for item in releases_data.get("results", []):
+        r = item.get("item", item.get("release", item))
+        releases.append({
+            "id": item.get("item_id", r.get("id")),
+            "name": r.get("name", "Unknown"),
+        })
+
+    return individual_tracks, releases
+
+
+def fetch_release_tracks(release_id, token):
+    """リリースに含まれる全トラックを返す。"""
+    data = api_get(f"/catalog/releases/{release_id}/tracks/?per_page=200", token)
+    tracks = []
+    for t in data.get("results", []):
+        tracks.append({
+            "id": t["id"],
+            "name": t["name"],
+            "mix": t.get("mix_name", "Original Mix"),
+            "artists": ", ".join(a["name"] for a in t.get("artists", [])),
+        })
+    return tracks
+
+
+# ---------------------------------------------------------------------------
+# Duplicate analysis
+# ---------------------------------------------------------------------------
+
+def normalize_key(name, artists):
+    """曲名ベースの名寄せキーを生成する。
+    Why: 同一楽曲の別 Mix を検出するため、括弧内の Mix 情報を除外し
+    アーティスト名の先頭（= メインアーティスト）だけで比較する。
+    """
+    base = name.lower().strip()
+    if " (" in base:
+        base = base.split(" (")[0].strip()
+    primary_artist = artists.lower().split(",")[0].strip()
+    return (base, primary_artist)
+
+
+def analyze_duplicates(all_tracks):
+    """全トラックを分析し、重複情報を返す。"""
+    # --- Check 1: Track ID exact match ---
+    id_groups = defaultdict(list)
+    for t in all_tracks:
+        id_groups[t["id"]].append(t)
+    id_dupes = {k: v for k, v in id_groups.items() if len(v) > 1}
+
+    # --- Check 2: Name + artist normalization ---
+    name_groups = defaultdict(list)
+    for t in all_tracks:
+        key = normalize_key(t["name"], t["artists"])
+        name_groups[key].append(t)
+    name_dupes = {k: v for k, v in name_groups.items() if len(v) > 1}
+
+    # Why: リリース跨ぎの重複だけが購入ミスの可能性がある
+    cross_release = {}
+    same_release = {}
+    for key, entries in name_dupes.items():
+        sources = set(e["source"] for e in entries)
+        if len(sources) > 1:
+            cross_release[key] = entries
+        else:
+            same_release[key] = entries
+
+    # Why: 完全重複（同バージョン）と別バージョンを区別する
+    exact_dupes = {}
+    version_dupes = {}
+    for key, entries in cross_release.items():
+        full_names = set(f'{e["name"]} ({e["mix"]})' for e in entries)
+        if len(full_names) == 1:
+            exact_dupes[key] = entries
+        else:
+            version_dupes[key] = entries
+
+    return {
+        "id_dupes": id_dupes,
+        "exact_dupes": exact_dupes,
+        "version_dupes": version_dupes,
+        "same_release_dupes": same_release,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def format_track(t):
+    return f'{t["name"]} ({t["mix"]}) / {t["artists"]}'
+
+
+def print_report(individual_tracks, releases, release_tracks_map, results, output_json=False):
+    # Build full track list
+    all_tracks = []
+    for t in individual_tracks:
+        t["source"] = "個別トラック"
+        all_tracks.append(t)
+    for rel in releases:
+        tracks = release_tracks_map.get(rel["id"], [])
+        for t in tracks:
+            t["source"] = rel["name"]
+            all_tracks.append(t)
+
+    if output_json:
+        print(json.dumps({
+            "total_tracks": len(all_tracks),
+            "individual_count": len(individual_tracks),
+            "release_count": len(releases),
+            "tracks": all_tracks,
+            "duplicates": {
+                "id_exact": {str(k): [format_track(t) for t in v] for k, v in results["id_dupes"].items()},
+                "name_exact": {f"{k[0]} / {k[1]}": [{"track": format_track(t), "source": t["source"]} for t in v] for k, v in results["exact_dupes"].items()},
+                "name_version": {f"{k[0]} / {k[1]}": [{"track": format_track(t), "source": t["source"]} for t in v] for k, v in results["version_dupes"].items()},
+            },
+        }, ensure_ascii=False, indent=2))
+        return
+
+    total = len(all_tracks)
+    print(f"## Beatport Hold Bin チェック結果\n")
+    print(f"個別トラック: {len(individual_tracks)} 曲 / リリース: {len(releases)} 件 / 総トラック数: {total} 曲\n")
+
+    # --- Full track list ---
+    print("### 全トラック一覧\n")
+    current_source = None
+    for t in sorted(all_tracks, key=lambda x: (x["source"], x["name"])):
+        if t["source"] != current_source:
+            current_source = t["source"]
+            print(f"\n**{current_source}**")
+        dup_mark = ""
+        key = normalize_key(t["name"], t["artists"])
+        if key in results["exact_dupes"]:
+            dup_mark = " ★重複"
+        elif key in results["version_dupes"]:
+            dup_mark = " △別Ver"
+        print(f"- {format_track(t)}{dup_mark}")
+
+    # --- Duplicate report ---
+    print("\n\n### 重複チェック\n")
+
+    print("#### トラック ID 完全一致")
+    if results["id_dupes"]:
+        for tid, entries in results["id_dupes"].items():
+            print(f"\n**ID {tid}:**")
+            for t in entries:
+                print(f"- [{t['source']}] {format_track(t)}")
+    else:
+        print("なし\n")
+
+    print("\n#### 完全重複（同一曲・同一バージョン、リリース跨ぎ）")
+    if results["exact_dupes"]:
+        for key, entries in sorted(results["exact_dupes"].items()):
+            print(f"\n**{key[0]} / {key[1]}**")
+            for t in entries:
+                print(f"- [{t['source']}] {format_track(t)}")
+    else:
+        print("なし\n")
+
+    print("\n#### 別バージョン（Original vs Remix 等、リリース跨ぎ）")
+    if results["version_dupes"]:
+        for key, entries in sorted(results["version_dupes"].items()):
+            print(f"\n**{key[0]} / {key[1]}**")
+            for t in entries:
+                print(f"- [{t['source']}] {format_track(t)}")
+    else:
+        print("なし\n")
+
+    # --- Summary ---
+    exact_count = sum(len(v) for v in results["exact_dupes"].values())
+    version_count = sum(len(v) for v in results["version_dupes"].values())
+    print(f"\n### サマリー\n")
+    if exact_count == 0 and version_count == 0:
+        print("重複なし。このまま購入して問題ありません。")
+    elif exact_count > 0:
+        print(f"⚠ 完全重複 {len(results['exact_dupes'])} 件あり。購入前に整理してください。")
+    else:
+        print(f"完全重複なし。別バージョン {len(results['version_dupes'])} 件は意図的であれば問題ありません。")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def die(msg):
+    print(f"エラー: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main():
+    output_json = "--json" in sys.argv
+
+    if not output_json:
+        print("Beatport Hold Bin をチェック中...", file=sys.stderr)
+
+    # 1. Token
+    if not output_json:
+        print("  Chrome からトークン取得中...", file=sys.stderr)
+    token = get_token()
+
+    # 2. Find Hold Bin
+    if not output_json:
+        print("  Hold Bin を検索中...", file=sys.stderr)
+    cart_id = find_holdbin_cart_id(token)
+
+    # 3. Fetch items
+    if not output_json:
+        print("  トラック・リリース一覧を取得中...", file=sys.stderr)
+    individual_tracks, releases = fetch_holdbin_items(cart_id, token)
+
+    if not individual_tracks and not releases:
+        if output_json:
+            print(json.dumps({"total_tracks": 0, "message": "Hold Bin は空です"}))
+        else:
+            print("Hold Bin は空です。")
+        return
+
+    # 4. Fetch all release tracklists
+    release_tracks_map = {}
+    for i, rel in enumerate(releases):
+        if not output_json:
+            print(f"  リリース取得中... ({i+1}/{len(releases)}) {rel['name'][:40]}", file=sys.stderr)
+        release_tracks_map[rel["id"]] = fetch_release_tracks(rel["id"], token)
+
+    # 5. Build flat list and analyze
+    all_tracks = []
+    for t in individual_tracks:
+        t["source"] = "個別トラック"
+        all_tracks.append(t)
+    for rel in releases:
+        for t in release_tracks_map.get(rel["id"], []):
+            t["source"] = rel["name"]
+            all_tracks.append(t)
+
+    results = analyze_duplicates(all_tracks)
+
+    # 6. Output
+    print_report(individual_tracks, releases, release_tracks_map, results, output_json)
+
+
+if __name__ == "__main__":
+    main()
